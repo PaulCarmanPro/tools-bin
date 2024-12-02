@@ -1,0 +1,250 @@
+#!/bin/bash
+#
+# cpos [-[format]ext4|-[format]btrfs|-copy[os]|-[copy]keep]OS_PART|DIR
+#     [-[format]vfat|bios|-install[grub]|]EFI_PART|DIR
+#     -updategrub
+# shellcheck disable=SC2155 # declare/local on separate line
+
+# assist copy from SRCE_OS to DEST_OS
+# assist efi/grub preparation
+
+declare SRCE_OS_PART # source OS /dev/partition -- if empty, then not mounted by self
+declare SRCE_OS_DIR # source OS directory -- default /
+declare DEST_OS_PART # destination OS /dev/partition -- if empty, then not mounted by self
+declare DEST_OS_DIR # destination OS mounted directory
+declare DEST_CHROOT_DIR # DEST_OS_DIR when ready for chroot
+declare DEST_EFI_PART # /dev/partition of destination efi
+declare DEST_EFI_DIR # mountpint of destination efi -- default /boot/efi/
+
+CleanUp() { # may have --verbose
+   if [[ "$SRCE_OS_PART" && "$SRCE_OS_DIR" ]]; then
+      umount --all-targets --recursive "${@}" "$SRCE_OS_DIR"
+      rmdir "${@}" "$SRCE_OS_DIR"
+   fi
+   if [[ "$DEST_EFI_PART" && "$DEST_EFI_DIR" ]]; then
+      umount --all-targets --recursive "${@}" "$DEST_EFI_DIR"
+      rmdir "${@}" "$DEST_EFI_DIR"
+   fi
+   if [[ "$DEST_CHROOT_DIR" ]]; then
+      umount --all-targets --recursive "${@}" "$DEST_OS_DIR"
+      rmdir "${@}" "$DEST_CHROOT_DIR"
+   fi
+   if [[ "$HOME_HOST" ]]; then
+      printf '%s\n' "$HOME_HOST" > /proc/sys/kernel/hostname
+   fi
+   trap EXIT
+}
+
+EchoNote() { # [-options...] NOTE
+   echo "${@:1:$(($# - 1))}" "$(tput setaf 13)${!#}$(tput sgr0)"
+}
+
+EchoErr() { # CODE ERROR
+   >&2 echo "$(tput setaf 15)$2$(tput sgr0)"
+   [[ "$1" && 0 != "$1" ]] && exit "$1"
+}
+
+Prompt() { # PROMPT VARIABLE(S)
+   # shellcheck disable=SC2086
+   read -rp "$(tput setaf 14)$1$(tput sgr0)" $2
+}
+
+Trap() { # add a trap to existing trap -- Cleanup used instead, but I like this code
+    local zNew="$1"
+    local zSig="$2"
+    # Get raw trap output.
+    local zOld="$(trap -p "$zSig")"
+    # Extract previous commands from raw trap output.
+    zOld="${zOld#*\'}"          # Remove first ' and everything before it.
+    zOld="${zOld%\'*}"          # Remove last  ' and everything after  it.
+    zOld="${zOld//\'\\\'\'/\'}" # Replace every '\'' (escaped ') to just '.
+    # Combine new and old commands. Separate them by newline.
+    trap -- "$zOld"$'\n'"$zNew" "$zSig"
+}
+
+[[ 1 -gt "$#" || 2 -lt "$#" ]] \
+   && EchoErr 1 \
+"Create a bootable copy of the current OS onto a new partition.
+$ sudo $(basename "$0") [EFI_PARTITION] OS_PARTITION|DRIVE
+EFI_PART defaults to modify the current grub menu to include new OS.
+Note: Partition/Drive specifications do not need /dev/ prefix.
+Note: Specifying a drive for the OS_PARTITION allows partitioning."
+
+[[ 0 != "$(id -u)" ]] \
+   && EchoErr 1 "Copying root and rewriting partitions requires permissions."
+
+PartitionTest() { # /dev/...
+   [[ ! -b "$1" ]] && EchoErr 1 "$1 is not a block device."
+   local zModel=$(lsblk -no MODEL "$1")
+   [[ "$zModel" ]] && EchoErr 1 "$1 is device model $zModel, not a partition."
+}
+
+OS_PART="${!#}"
+OS_PART="/dev/${OS_PART#/dev/}"
+######## Perform a model test to automate table and partition generation
+PartitionTest "$OS_PART"
+
+if [[ 2 = "$#" ]]; then
+   EFI_PART="/dev/${1#/dev/}"
+   PartitionTest "$EFI_PART"
+   EFI_DRIVE="${EFI_PART:0:-1}"
+   while [[ ! -b "$EFI_DRIVE" ]] && [[ "$EFI_DRIVE" =~ /dev/??*  ]]; do
+      EFI_DRIVE="${EFI_DRIVE:0:-1}"
+   done
+   EFI_MODEL=$(lsblk -no MODEL "$EFI_DRIVE" 2>/dev/null)
+   [[ -z "$EFI_MODEL" ]] \
+      && EchoErro 1 "Could not find model for drive containing EFI partition $EFI_PART."
+   EFI_PART_NUMBER=$(sed -E 's/.*[^[:digit:]]([[:digit:]]+)/\1/' <<< "$EFI_PART")
+else
+   unset EFI_PART # do not test EFI_DRIVE or EFI_MODEL
+fi
+
+if [[ "$OS_PART" = "$EFI_PART" ]]; then
+      >&2 echo "The OS partition cannot be the same as the EFI partition."
+      exit 1
+fi
+
+if [[ "$EFI_PART" ]]; then
+   zSize=$(lsblk -no SIZE "$EFI_PART")
+   Prompt "Format/Bless ${zSize// /} $EFI_PART partition on drive $EFI_MODEL as vfat ? (y/N) "
+   if [[ "$REPLY" == [yY] ]]; then
+      EchoNote -n "Formatting $EFI_PART..."
+      mkdosfs -F 32 -I -n EFI "$EFI_PART"
+      EchoNote -n "Blessing $EFI_PART..."
+      parted "$EFI_DRIVE" set "$EFI_PART_NUMBER" boot on
+   fi
+fi
+zSize=$(lsblk -no SIZE "$OS_PART")
+
+EchoNote "-- It is courtious to close open files existing on the root mount before copy. --"
+Prompt "Format before copying / to ${zSize// /} $OS_PART partition as ext4 ? (y/N) "
+if [[ "$REPLY" == [yY] ]]; then
+   Prompt "What label for $OS_PART partition (16 byte max) (consider hostname) ? " PART_NAME
+   EchoNote -n "Formatting $OS_PART..."
+   mkfs.ext4 -L "$PART_NAME" "$OS_PART"
+else
+   PART_NAME=$(lsblk -no LABEL "$OS_PART")
+fi
+
+OS_DIR="/mnt/OS_$(basename "$0")_$$"
+# shellcheck disable=SC2064 # Use single quotes, otherwise this expands now rather than when signalled.
+trap "CleanUp"
+mkdir --parents "$OS_DIR"
+mount --verbose "$OS_PART" "$OS_DIR"
+if [[ "$REPLY" != [yY] ]]; then
+   Prompt "Copy newer files onto ${zSize// /} $OS_PART from / ? (y/N) "
+fi
+if [[ "$REPLY" == [yY] ]]; then
+   Prompt "Itemize changes during copy ? (y/N) "
+   if [[ "$REPLY" == [yY] ]]; then
+      zItemizeProgress=--itemize-changes
+   else
+      zItemizeProgress=--info=progress2
+   fi
+   EchoNote -n "Copying root mount onto $OS_PART (be patient)..."
+   # this rsync command implicitly does NOT preserve --acls  --atimes  --crtimes (not supported) --hard-links --xatts
+   rsync --archive \
+         --delete \
+         --exclude-from="$(dirname "$0")/cpos.exclude" \
+         --force \
+         $zItemizeProgress \
+         --one-file-system \
+         --open-noatime \
+         --perms \
+         --preallocate \
+         --times \
+         / "$OS_DIR"
+fi
+
+UpdateFstab() { # PARTITION MOUNT_POINT
+   # cause declaration of MOUNT_POINT to mount PARTITION instead of what is written
+   local zFound=$(tr $'\t' ' ' < "$OS_DIR/etc/fstab" | tr -s ' ' | grep -ne "^[^#].* $2 .*")
+   local zCount=$(wc -l <<< "$zOld")
+   if [[ -z "$zFound" ||  1 != "$zCount" ]]; then
+      EchoNote
+      [[ -z "$zFound" ]] \
+         && >&2 echo "Could not locate UUID requesting mount of $2 in $OS_DIR/etc/fstab." \
+         || >&2 echo "Found $zCount requests for mount of $2 in $OS_DIR/etc/fstab."
+      Prompt "Require manual modification for ability to reboot ? (y/N) " && [[ "$REPLY" == [yY] ]] || exit 2
+   fi
+   local zLine=$(cut -d: -f1 <<< "$zFound")
+   local zOld=$(cut -d: -f2- <<< "$zFound" | cut -d' ' -f1)
+   local zNew="UUID=$(lsblk -no UUID "$1")"
+   if [[ "$zOld" && "$zOld" != "$zNew" ]]; then
+      cp "$OS_DIR/etc/fstab" "$OS_DIR/etc/fstab~"
+      sed -i -E "$zLine"'!'"b ; s|^[^[:space:]]+|$zNew|" "$OS_DIR/etc/fstab"
+      echo "$zOld -> $(sed -n "$zLine"p < "$OS_DIR/etc/fstab")"
+   else
+      echo "fstab $2 already auto-mounted as $1"
+   fi
+}
+
+EchoNote "Updating $OS_PART/etc/fstab..."
+UpdateFstab "$OS_PART" /
+UpdateFstab "$EFI_PART" /boot/efi
+
+EchoNote "Preparing for chroot $OS_DIR..."
+mount --verbose "$EFI_PART" "$OS_DIR/boot/efi"
+mount --verbose --bind /dev "$OS_DIR/dev"
+mount --verbose --bind /proc "$OS_DIR/proc"
+mount --verbose --bind /sys "$OS_DIR/sys"
+chroot "$OS_DIR" mount -av | grep ": success"
+
+HOME_HOST=$(cat /proc/sys/kernel/hostname)
+zHasHost=$(cat "$OS_DIR/etc/hostname")
+Prompt "What hostname would you like to unique the new OS ($zHasHost) ? " NEW_HOST
+: "${NEW_HOST:=$zHasHost}"
+if [[ "$NEW_HOST" = "$zHasHost" && "$NEW_HOST" = "$HOME_HOST" ]]; then
+   unset HOME_HOST
+else
+   # set-hostname alters 'the pretty, the static, and the transient hostname alike'
+   # chroot "$OS_DIR" hostnamectl set-hostname "$NEW_HOST"
+   #   error because did not boot to this OS, but will change /proc/sys/kernel/hostname -- so do it manually
+   if [[ "$PART_NAME" != "$NEW_HOST" ]]; then
+      EchoNote "Changing partition $OS_PART label to hostname..."
+      tune2fs -L "$NEW_HOST" "$OS_PART"
+   fi
+   EchoNote "Setting static hostname in $OS_DIR/etc/hostname..."
+   printf '%s\n' "$NEW_HOST" > "$OS_DIR/etc/hostname"
+   EchoNote "Setting static network hostname in $OS_DIR/etc/hosts..."
+   cp "$OS_DIR/etc/hosts" "$OS_DIR/etc/hosts~"
+   sed -i -E "s|^(127.0.1.1[[:space:]]+)[^.[[:space:]]+(\\.[^[:space:]]*)?(([[:space:]]+)([^.[:space:]]+))?|\\1$NEW_HOST\\2\\4$NEW_HOST|" "$OS_DIR/etc/hosts"
+   EchoNote "Setting transient hostname in /proc/sys/kernel/hostname..."
+   # /proc/sys/kernel/hostname discontinuity causes a LOT of problems
+   # only chroot commands allowed before reinstating the original hostname
+   printf '%s\n' "$NEW_HOST" > "$/proc/sys/kernel/hostname"
+fi
+
+if [[ "$EFI_PART" ]]; then
+   Prompt "Install GRUB onto $EFI_PART ? (y/N) "
+   if [[ "$REPLY" == [yY] ]]; then
+      # grub-install -- directory options might avoid chroot need
+      chroot "$OS_DIR" rm -fr /boot/efi/EFI/* # old installs prevent new install with new hostname
+      chroot "$OS_DIR" grub-install # --verbose has a lot to say
+      # the names inside /boot/efi/EFI/ determine UEFI labels
+      # grub-install may use hostname as a directory name to produce UEFI label
+      # grub-install MUST use debian as a directory name or will NOT boot
+      # installs for x86_64-efi
+      # grub-install: warning: EFI variables are not supported on this system.. (no errors)
+   fi
+fi
+
+Prompt "Search for /boot/initrd and vmlinux images in $OS_PART/boot.
+Search across all devices partitions for OSes.
+And generate GRUB menu into $EFI_PART/grub.cfg ? (y/N) "
+if [[ "$REPLY" == [yY] ]]; then
+   chroot "$OS_DIR" update-grub
+fi
+
+Prompt "Leave $OS_PART fully mounted (y/N) ?"
+if [[ "$REPLY" != [yY] ]]; then
+   CleanUp --verbose
+else
+   cd "$OS_DIR" || EchoError 1 "Could not find $OS_DIR"
+   EchoNote "Did NOT # umount -AR ${OS_DIR@Q}" \
+   "May chroot $OS_DIR." \
+   "Transient hostname will not match which causes dbus problems."
+   unset OS_DIR
+   CleanUp
+fi
+echo "$(tput setaf 11)(-: Happy Booting :-)$(tput sgr0)"

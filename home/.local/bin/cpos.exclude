@@ -1,0 +1,25 @@
+# me
+.tote
+# general
+*~
+*.cache
+*.log
+*.o
+Cache
+cache
+tmp
+# .mozilla
+Crash Reports
+crash-reports
+crashes
+recently-used.xbel*
+# emacs
+%*%~
+*.lock
+.emacs.d/.emacs.desktop
+.emacs.d/auto-save
+.emacs.d/auto-save-list
+.emacs.d/backup
+# nano
+\#*#
+*.save

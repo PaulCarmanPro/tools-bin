@@ -1,0 +1,485 @@
+#!/bin/bash
+#shellcheck disable=SC2015 # && || not same as if-then-else
+#shellcheck disable=SC2086 # doublequote to prevent globbing and word splitting
+#shellcheck disable=SC2155 # declare and assign hides return value
+
+# align [COMMAND] [REPOSITORY]...
+#   does nothing if sourced
+#   Summary: synchronizes files between $HOME and /home in repositories and github
+#   Description:
+#     Git repositories are nice, but not directly usefull.
+#       Repository files stored in repository/home/ need to be installed into the $HOME/.
+#       Files are edited and tested in $HOMEw/ folder then outstalled into the repository
+#       The repository is then pushed into github
+#       ...and reverse...
+#     Files are limited according to files which exist in the repository.
+#       Files not in the repository are not copied from home
+#       unless a file called .alignall exists,
+#         then all the files in that folder and installed from home
+#         and outstalling may cause files to be deleted from home.
+# COMMAND
+#   [sync]install = copy newer files from local repository into $HOME
+#   [sync]outstall = copy newer files from $HOME into local repository
+#   [git]add|stage = stage all new/deleted files
+#   [git]commit = stage + commit all changes in local repository
+#   [git]push = commit + copy updates from local repository to github
+#   [git]pull = copy updates from github to local repository
+#   [all]in = pull + install
+#   [all]out = outstall + push
+#   [all]sync = out + in = the DEFAULT action
+# REPOSITORY where DEFAULT is $PWD
+#   directory containing the local repository
+#   directory to recursive search for local repositories
+#   search for regex directories *REPOSITORY* defaulting directory to /7/ ($GIT_DIR)
+#
+# !!! SyncOut() uses a newline separated filename list !!!
+
+set-f # noglob
+set -o pipefail
+
+[[ "$GIT_DIR" ]] || declare GIT_DIR=/7
+declare TEMP="/tmp/$(basename "${BASH_SOURCE[0]}").$$"
+#shellcheck disable=SC2064 # expand now rather than when signated
+trap "set +f; rm -f ${TEMP@Q}*" EXIT
+
+Main() {
+   # case insensitive
+   #   [([All]In|Out|Sync|[Git](Add|Clone|Commit|Pull|Push|Stage)|[R?sync](In|Out)stall)]:-Sync
+   # [DIR|MATCH]:-$PWD...
+   local zFun=
+   if [[ "${1,,}" =~ (all)?(in|out|sync) ]]; then
+      BASH_REMATCH[1]=${BASH_REMATCH[1],,}
+      zFun="All${BASH_REMATCH[1]^}"
+   elif [[ "${1,,}" =~ (git)?(add|clone|commit|pull|push|stage) ]]; then
+      BASH_REMATCH[2]=${BASH_REMATCH[2],,}
+      zFun="Git${BASH_REMATCH[2]^}"
+   elif [[ "${1,,}" =~ (r?sync)?(out|in)stall ]]; then
+      BASH_REMATCH[2]=${BASH_REMATCH[2],,}
+      zFun="Sync${BASH_REMATCH[2]^}"
+   fi
+   # default directory to $PWD
+   [[ 0 -ne "$#" ]] \
+      || set "$PWD"
+   local zDir
+   # apply function to repository list
+   for zDir in "$@"; do
+      printf '\n================= %s\n' "${zDir@Q}"
+      if ! cd "$zDir"; then
+         Echo \# "Could not change working directory to ${zDir@Q}."
+      elif [[ -z "$(find . -mindepth 1 -print -quit)" ]]; then
+         Echo \# "Nothing found in ${zDir@Q}."
+         [[ c != "$(Prompt cn "Clone git repository into ${zDir@Q}.")" ]] \
+           || GitClone
+      elif [[ ! -d ".git" ]]; then
+         Echo \# ".git not found in ${zDir@Q}."
+         [[ c != "$(Prompt cn "Ceaate git repository in ${zDir@Q}.")" ]] \
+           || GitInit
+      else
+         ${zFun:-AllSync} # cannot use cd
+         cd "$OLDPWD" || true
+      fi
+   done
+}
+
+declare -A cEcho
+cEcho[' ']=  # no color
+cEcho['!']=1 # bright red
+cEcho['#']=3 # bright yellow
+cEcho['.']=6 # bright cyan
+cEcho['?']=7 # bright white
+
+Echo() { # [-n] [cEcho[CHAR_KEY]] [CODE] MESSAGE...
+   # -n = no newline
+   # redirects output to stderr
+   # do not create dependency upon other installations
+   # use of CODE causes exit while \! does not.
+   local zCode zPre zNoNew
+   while [[ '-' = "${1:0:1}" ]]; do
+      case "$1" in
+         -n) zNoNew=t ;;
+         --) shift; break ;;
+         *) Echo 1 "Echo unknown option ${1@Q}."
+      esac
+      shift
+   done
+   if [[ -z "$1" || "${cEcho["$1"]:+x}" ]]; then
+      zPre="$1"
+      shift
+   fi
+   if [[ "$1" =~ ^[0-9]*$ ]]; then
+      zCode="$1"
+      shift
+      : "${zPre:=!}"
+   else
+      : "${zPre:=.}"
+   fi
+   local zBrt zDim zOff
+   zDim="${cEcho["$zPre"]}"
+   if [[ "$zDim" ]]; then
+      zBrt=$(tput setaf $((8 + zDim)))
+      zDim=$(tput setaf "$zDim")
+      zOff=$(tput sgr 0)
+   fi
+   printf '%s' "$zBrt$zPre$zPre$zPre$zOff "
+   printf '%s: ' "$(basename -- "${BASH_SOURCE[0]}")"
+   printf '%s' "$zDim$1$zOff"
+   [[ 1 -lt "$#" ]] \
+      && printf "\n  $zBrt%s$zOff" "${@:2}"
+   [[ "$zNoNew" ]] \
+      || echo
+   [[ -z "$zCode" ]] \
+      || exit "$zCode"
+} >&2
+
+Prompt() { # KEYS PROMPT
+   local zIn=$(realpath /proc/$$/fd/0)
+   [[ "$zIn" =~ (pts|tty[0-9]*) ]] \
+      || Echo 2 "Expecting stdin from pts or tty but found ${zIn@Q}."
+   local zAns
+   local zKeys="$1"
+   local zPrompt="$2 ? ($(sed -E 's|(.)(.)|\1/\2|g' <<< "$zKeys")) "
+   while [[ ! "${zAns,}" =~ ^[$zKeys]$ ]]; do
+      Echo -n \? "$zPrompt"
+      read -rN1 zAns > "$zIn"
+      echo > "$zIn"
+   done
+   echo "${zAns,}"
+}
+
+# !!! MAJOR PROBLEM !!!
+# If files exist in destination directory,
+#   and destination is lower than $HOME/[^/]+/ (grandchild of home),
+#   then ALL files in that directory must come from source?
+# Rsync filtering via simulated --exclude is wrong below that point ?
+
+Rsync() {
+   rsync \
+      --acls \
+      --archive \
+      --chown=$USER:$USER \
+      --executability \
+      --filter="merge $HOME/.rsync-filter" \
+      --filter="dir-merge /.rsync-filter" \
+      --filter='- README.md' \
+      --hard-links \
+      --human-readable \
+      --itemize-changes \
+      --keep-dirlinks \
+      --links \
+      --mkpath \
+      --numeric-ids \
+      --omit-dir-times \
+      --one-file-system \
+      --open-noatime \
+      --partial \
+      --perms \
+      --preallocate \
+      --safe-links \
+      --sparse \
+      --times \
+      --update \
+      --xattrs \
+      "$@"
+}
+c
+#
+# Dual actions to go all the way
+#
+
+AllIn() {
+   # get newer from github into $HOME through repository
+   GitPull && SyncIn
+}
+
+AllOut() {
+   # push newer from $HOME into github through repository
+   SyncOut && GitPush
+}
+
+AllSync() {
+   # swing both ways to sync everything
+   AllOut && AllIn
+}
+
+#
+# CONFIGUREATION
+
+
+GitUserName() {
+   local zCmd='git config --global user.name'
+   local zName
+   while ! zName="$($zCmd)"; do
+      read -r -p "$zCmd = "
+      $zCmd "$REPLY"
+   done
+   printf '%s\n' "$zName"
+}
+
+GitUserEmail() {
+   local zCmd='git config --global user.email'
+   local zEmail
+   while ! zEmail="$($zCmd)"; do
+      read -r -p "$zCmd = "
+      $zCmd "$REPLY"
+   done
+   printf '%s\n' "$zEmail"
+}
+
+#
+# PRIMITIVE
+#
+
+GitAdd() { # alias for GitStage
+   Echo \# "Considering stage of added/removed files in $PWD..."
+   local zCmd='stage --dry-run --all'
+   Echo \. "  git $zCmd"
+   git $zCmd | tee "$TEMP"
+   if ! grep --invert-match --silent --extended-regex '^##' < "$TEMP"; then
+      Echo \. "  Already staged."
+      return
+   fi
+   [[ y = "$(Prompt yn "Perform stage in $PWD")" ]] \
+      || return 130
+   zCmd='git stage --all'
+   Echo \. "  $zCmd"
+   $zCmd
+}
+
+GitClone() {
+   # consider init
+   if [[ "$(find . -mindepth 1 -print -quit)" ]]; then
+      Echo \! "Cannot git clone into a nonempty directory."
+      [[ i = "$(Prompt in "Init git repository")" ]] \
+         || return 130
+      GitInit && GitPush
+      return
+   fi
+   # clone
+   local zCmd=('git' 'clone' \
+                     '--remote-submodules' \
+                     "gituser:$(basename "$PWD").git" \
+                     "$PWD")
+   Echo \# "  ${zCmd[*]}..."
+   "${zCmd[@]}" && return
+   local zCode=$?
+   Echo "$zCode" "Cannot handle git clone error code $zCode."
+}
+
+GitCommit() {
+   GitAdd
+   local -i zCode=$?
+   if [[ 0 -ne "$zCode" ]]; then
+      Echo \! "Failed stage with code $zCode... Commit aborted."
+      return "$zCode"
+   fi
+   Echo \# "Considering commit of all modified files in $PWD..."
+   local zCmd='commit --dry-run --all --branch --short'
+   Echo \. "  git $zCmd"
+   git $zCmd | tee "$TEMP"
+   if ! grep --invert-match --silent --extended-regex '^##' < "$TEMP"; then
+      Echo \. "  Already committed."
+      return
+   fi
+   [[ y = "$(Prompt yn "Perform commit in $PWD")" ]] \
+      || return 130
+   zCmd='git commit --all'
+   Echo \. "  $zCmd"
+   $zCmd
+}
+
+GitInit() {
+   [[ -e .git ]] \
+     && Echo 1 "Cannot init because .git repository exists in ${PWD@Q}."
+   # validate name
+   local zName=$(basename $PWD)
+   if [[ ! "$zName" =~ [-._[:alnum:]]+ ]]; then
+      Echo \! "Repository name $zName does not fit regex [-._[:alnum:]]"
+      [[ y = "$(Prompt yn "Continue with special name")" ]] \
+         || return 130
+   fi
+   local zCmd='git init'
+   Echo \# "$zCmd..."
+   $zCmd
+}
+
+GitPull() {
+   # --dry-run says [up to date] when commit is ahead even when pull is needed
+   [[ -e .git ]] \
+      || GitClone \
+      || return
+   Echo \# "Pulling into \"$PWD\"..."
+   zCmd='git pull'
+   Echo \. "  $zCmd"
+   $zCmd 2>"$TEMP.err" | tee "$TEMP"
+   local zCode=$?
+   case "$zCode" in
+      0) if grep -q 'Already up to date' "$TEMP"; then
+            Echo \. '  Already pulled.'
+            return
+         fi
+         ;;
+      *) Echo "$zCode" "Unknown git pull code $zCode" \
+              "$(cat "$TEMP.err")"
+         ;;
+   esac
+}
+
+GitPush() {
+   # commit
+   GitCommit
+   local -i zCode=$?
+   [[ 0 -ne "$zCode" ]] \
+      && Echo \! "Failed commit with code $zCode... Push aborted." \
+      && return "$zCode"
+   # push
+   local zDest
+   if ! zDest=$(git config --get remote.origin.url); then
+      zBase=$(basename "$PWD")
+      Echo \! 'No configured push destination...'
+      [[ ! "$zBase" =~ '-._'[[:almum:]]* ]] \
+         && Echo 1 "Directory name ${zBase@Q} does not match -._[[:almum:]]*."
+      zCmd="git remote add origin git@github.com:$(GitUserName)/$zBase.git"
+      Echo \. "  $zCmd..."
+      $zCmd \
+         || Echo 1 'I tried, but you really need to create repositories via the browser.' \
+                 'Username/Password configuration from the command line has been disabled.'
+   fi
+   Echo \# "Pushing all branches to $zDest..."
+   local zCmd='git push --all --set-upstream'
+   Echo \. "  $zCmd"
+   $zCmd 2>"$TEMP.err" | tee "$TEMP"
+   local zCode=$?
+   case "$zCode" in
+      0) if grep -q 'Everything up-to-date' "$TEMP.err"; then
+            Echo \. '  Already pushed.'
+            return
+         fi
+         ;;
+      1) if grep -q 'tip of your current branch is behind' "$TEMP.err"; then
+            Echo \! '  Git claims that you must pull first.'
+            return 1
+         else
+            Echo \! '  Unknown reason for push code 1.' 'FIX ME'
+            return 1
+         fi
+         ;;
+      128) # !!! need to improve public key grep !!!
+         if grep -q 'register public key' "$TEMP.err"; then
+            Echo \! 'Need to register public key...'
+            local zType='rsa'
+            local zKey="$HOME/.ssh/id_$zType"
+            if ! [[ -e "$zKey.pub" ]]; then
+               local zCmd="ssh-keygen -t ${zType@Q} -f ${zKey@Q}"
+               Echo \. "  $zCmd"
+               mkdir -p "$(dirname "$zKey")" \
+                  || Echo 1 'Could not create key directory.'
+               $zCmd \
+                  || Echo 1 'Could not generate key.'
+            fi
+            Echo \! "Paste public $zType key into github." \
+                 'Click your profile picture on the far right' \
+                 'Then goto settings > SSH keyst...'
+            xclip -selection clipboard < "$zKey.pub" \
+               && Echo \# 'Public key copied to clipboard.' \
+                  || Echo 1 "Could not copy key from $zKey.pub"
+            exit 1
+         else
+            Echo "$zCode" "Unknown reason for git push code $zCode" \
+                 "$(cat "$TEMP.err")"
+         fi
+         ;;
+      130) # ^C
+         Echo 130 '  User Abort.'
+         ;;
+      *) Echo "$zCode" "Unknown git push code $zCode." \
+              "$(cat "$TEMP.err")"
+   esac
+}
+
+alias GitStage=GitAdd
+
+SyncIn() {
+   local zHome="$PWD/home/"
+   Echo \# "Considering rsync ${zHome@Q} ${HOME@Q}/..."
+   [[ -e "$zHome" ]] \
+      || Echo 1 "Could not find ${zHome@Q}."
+   Rsync --dry-run "$zHome" "$HOME/" | tee "$TEMP"
+   if ! [[ -s "$TEMP" ]]; then
+      Echo \. "  Already installed."
+      return
+   fi
+   case $(Prompt yn "Perform rsync install into $HOME") in
+      n) return 130
+   esac
+   Rsync "$zHome" "$HOME/"
+}
+
+SyncOut() {
+   # copy from home to repository
+   # files extracted from home are determined by files stored in repository
+   #   new files are excluded unless they are a descendant of a directory containing .alignall
+   #   data levels containing .git are excluded from copy
+   local zHome="$PWD/home/"
+   Echo \# "Considering rsync ${HOME@Q}/ ${zHome@Q}..."
+   [[ -e "$zHome" ]] \
+      || Echo 1 "Could not find ${zHome@Q}."
+   # use of find --existing is terribly slow -- and not directly desired
+   # generate list of files to sync with .alignall and .git
+   # %P strips top level directory specification
+   local zAlls zGits zFiles
+   zFiles=$(find "$zHome" \
+                 -type f -printf '%P\n' \
+                 -name '.alignall' -prune \
+                 -o type d -name '.git' -printf '%P\n' -prune ) \
+      || { Echo \! "No files to outsstall within ${zHome@Q}." \
+              && return 1; }
+   # filter all directories containing .git because subrepositories are never outstalled
+   zGits=$(sed -nE 's/(.*)/.git$/\1/p' <<< "$zFiles") \
+      && zFiles=$(grep -Fvw --file=<(printf '%s\n' "$zGits") \
+                       <<< "$zFiles" | sponge)
+   # filter all directories containing .alignall then add parents to outstall all descendant
+   # zAlls must be considered separately to consider deletes
+   zAlls=$(sed -nE 's/(.*)/.alignall$/\1/p' <<< "$zFiles") \
+      && zFiles=$(grep -Fvw --file=<(printf '%s\n' "$zAlls") \
+                       <<< "$zFiles" | sponge) \
+      && zFiles+=$'\n'"$zAlls"
+   Rsync --dry-run \
+         --files-from <<< "$zFiles" \
+         "$HOME/" "$zHome" \
+         2>"$TEMP.err" \
+      | tee "$TEMP"
+   # deal with existing files
+   if ! [[ -s "$TEMP" ]]; then
+      Echo \. "  Already outstalled."
+   elif [[ y = "$(Prompt yn "Perform rsync outstall outto $PWD/home/")" ]]; then
+      Rsync --files-from <(cat <<< "$zFiles") \
+            "$HOME/" "$zHome"
+   fi
+   # deal with extra files
+   sed -n 's/^rsync: \[sender\] link_stat "\(.*\)" failed: No such file or directory (2)$/\1/p' \
+       < "$TEMP.err" > "$TEMP.not"
+   # need to consider remaining from $zAll
+   if [[ -s "$TEMP.not" ]]; then
+      local -a zList
+      readarray -t zList \
+                < <(cut -c$((2+${#HOME}))- < "$TEMP.not" \
+                       | awk -v PREFIX="$zHome" '{print PREFIX$0}')
+      Echo \? \
+           "${#zList[@]} files not yet installed exist in repository ${zHome@Q}..." \
+           "${zList[@]}"
+      case $(Prompt rn "Remove ${#zList[@]} files from repository") in
+         n) Echo \# "The files will be installed during SyncInstall" ;;
+         r) printf '%s\0' "${zList[@]}" | xargs -d '\0' rm -v ;;
+      esac
+   fi
+}
+
+#
+# Main
+#
+
+# do not do anything if is an include
+if [[ "$0" = "${BASH_SOURCE[0]}" ]]; then
+   # set -e # exit on error
+   Main "$@"
+fi

@@ -1,0 +1,64 @@
+#!/usr/bin/bash
+#
+# x [EMACS-OPTIONS] FILE-NAME [EMACS-CLIENT-OPTIONS]
+#
+# emacsclient not a simple startup
+#   must wait for full start of emacs which then starts the client
+#
+# Note: EMACS-OPTIONS will NOT be used if emacs is already running
+# --debug-init to locate init problem # M-x goto-pos # to goto a character position
+# --no-desktop to deal with desktop problems
+#
+
+set -e
+
+declare -a aOptions=()
+while [[ - = "${1:0:1}" ]]; do
+   aOptions+=("$1")
+   shift
+done
+# !!! should notify in event options were provided, but emacs was already started.
+focus emacs "${aOptions[@]}" # startup emacs without any file
+[[ 0 -eq $# ]] && exit # emacsclient will complain without file to open
+
+if ! pgrep emacs &>/dev/null; then
+   notify-send --app-name="${BASH_SOURCE[0]}" \
+               --category=focus \
+               --expire-time=1600 \
+               --replace-id=251 \
+               --urgency=critical \
+               -- "Emcas did not start" &
+   exit 1
+fi
+
+ClientNotRunning() {
+   ! lsof -c emacs | grep server &>/dev/null
+}
+export -f ClientNotRunning
+dName="${BASH_SOURCE[0]}"
+
+if ClientNotRunning; then
+   # client expected to be started as late as possible
+   notify-send --app-name="$dName" \
+               --expire-time=72000 \
+               --replace-id=$$ \
+               -- "Please wait for emacs to start..." &
+   timeout 10 bash -c 'while ClientNotRunning; do :; done'
+   # would be nice to tell emacs to not front previous file in this case
+   sleep 2 # need to wait a little longer for file recovery
+   if [[ 124 = "$?" ]]; then
+      notify-send --app-name="$dName" \
+                  --category=focus \
+                  --expire-time=3000 \
+                  --replace-id=251 \
+                  --urgency=critical \
+                  -- "Emcas client server did not start" &
+      exit 1
+   else
+      notify-send --app-name="$dName" \
+                  --expire-time=1 \
+                  --replace-id=$$ \
+                  -- "Ok" &
+   fi
+fi
+emacsclient --no-wait "$@"

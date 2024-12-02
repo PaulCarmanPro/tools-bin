@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+
+# volume ([-+])([0-9]*)(%|s)?
+#   changes volume by percent
+#     where [0-9]* indicates DELTA change were default is 1
+#     where % declares DELTA to be a percentage of current volume
+#     where s (the default) multiplies DELTA by the natural log of (current volume + 1.1) / e
+# volume -n|--next|-p|--prev
+#   changes default source to next or previous sink
+#   NOTE: Does not change current sink
+
+# @see https://gitlab.freedesktop.org/pipewire/pipewire/-/wikis/Migrate-PulseAudio#sinksource-port-volumemuteport-latency
+
+#shellcheck disable=SC2155 # declare assign in different steps
+
+set -f
+
+dBase=$(basename "${BASH_SOURCE[0]}")
+dDir=$(dirname "${BASH_SOURCE[0]}")
+dNoteIcon="$dDir/$dBase.jpeg" # notification image
+dVerbose= # show extra information?
+dVolMax=400 # Maximum volume (integer percent)
+
+#
+## User Output
+#
+
+Error() { # [CODE] ERROR...
+   local zCode
+   if [[ "$1" =~ [0-9]+ ]]; then
+      zCode="$1"
+      shift
+   fi
+   Note ! critical "${1:-Error}" "${@:2}"
+   >&2 printf '%s\n' "${1:-Error}" "${@:2}"
+   [[ 0 -eq "${zCode:-0}" ]] \
+      || exit "$zCode"
+}
+
+Note() { # DIRECTION URGENCY MESSAGE...
+   # notify-send the replaceable volume notification
+   local zRep
+   [[ 1 -eq "${#1}" ]] \
+      && zRep="$1$1$1" \
+         || zRep="$1"
+   notify-send --app-name="${dBase:-$0}" \
+               --category="$dBase" \
+               --expire-time=1600 \
+               --icon="$dNoteIcon" \
+               --replace-id=250 \
+               --urgency="${2:-normal}" \
+               -- "$zRep $dBase $zRep" \
+               "$(printf '%s\n' "${@:3}")" # might take a lone time
+}
+
+NoteContent() { # [ID:-@DEFAULT_AUDIO_SINK@]
+   # output text which indicates volume level
+   # always output the sink volume
+   local zName=$(GetName "$@")
+   local zVolume=$(GetVolume "$@")
+   printf '<b>%s</b> = <b>%s%%</b>\n' "${zName^}" "$zVolume"
+}
+
+NoteNoLock() { # DIRECTION [ID:-@DEFAULT_AUDIO_SINK@]
+   # post notification without deadlock caused by slow notification manager
+   local zId=$(pgrep --full --oldest --runstates D,R,S \
+                     "^(((/usr)?/bin/)?bash )?$0($| )") # -f excludes argument quotes
+   [[ "$zId" ]] \
+      || Error 1 "Could not find $0 as a process" "$(ps -fa)"
+   # code 1 if notification is not attempted by this process
+   [[ $$ = "$zId" ]] \
+      || return # let other process do this -- see loop below
+   # !!! poor way to do this ... $1 never updates !!!
+   local zNewMessage=$(NoteContent "${@:2}")
+   local zOldMessage=
+   while [[ "$zNewMessage" != "$zOldMessage" ]]; do
+      Note "$1" "normal" "$zNewMessage"
+      zOldMessage="$zNewMessage"
+      zNewMessage=$(NoteContent)
+   done
+   true
+}
+
+#
+## Get/Set Routines
+#
+
+GetId() { # [GROUP:-Audio] [NAME:-Sinks]
+   # outputs the default id
+   GetIds "$@" | sed -nE 's:\*::p'
+}
+
+GetIdNext() { # [DELTA:-1] [GROUP:-Audio] [NAME:-Sinks]
+   # outputs id which is DETLA ids after the default id
+   local zDelta=${1:-1}
+   local zIds=$(GetIds "${@:2}")
+   local -i zCount=$(wc -l <<< "$zIds")
+   local -i zIndex=$(grep -Fn "*" <<< "$zIds" | cut -d: -f1)
+   local -i zNext=$((zIndex + zDelta - 1))
+   zNext=$((zNext % zCount))
+   [[ 0 -gt "$zNext" ]] && zNext=$((zNext + zCount))
+   sed -nE $((zNext+1))'s/^\*?(.*)/\1/p' <<< "$zIds"
+}
+
+GetIds() { # [GROUP:-Audio] [NAME:-Sinks]
+   # output list  of ids in GROUP with NAME
+   # the default (if one  exists) will be preceded by an *
+   GetIdsRaw "$@" | sed -E 's:[^*0-9]+(\*)?[ \t]*([0-9]+).*:\1\2:'
+}
+
+GetIdsRaw() { # [GROUP:-Audio] [NAME:-Sinks]
+   # output wpctl status lines in GROUP with NAME
+   local zGroup=${1:-Audio}
+   local zName=${2:-Sinks}
+   wpctl status \
+      | awk \
+           -v GROUP="${zGroup^}" \
+           -v NAME="${zName^}:" \
+           '
+$0=="" {
+  FoundGroup=0
+  next
+}
+$0==GROUP {
+  FoundGroup=1
+  next
+}
+!FoundGroup {
+  next
+}
+$2==NAME {
+  FoundName=1
+  next
+}
+$2=="" {
+  FoundName=0
+  next
+}
+FoundName {
+  print $0
+  next
+}
+'
+}
+
+GetName() { # [ID:-@DEFAULT_AUDIO_SINK@]
+   # return the api name of the ID specified
+   local zName=$(wpctl inspect "${1:-@DEFAULT_AUDIO_SINK@}" \
+                    | sed -n 's/[ ]*api.alsa.card.name = //p') \
+      || Error 1 "Could not get $1 name"
+   eval "echo $zName" # remove quotes output by wpctl
+}
+
+GetVolume() { # [ID:-@DEFAULT_AUDIO_SINK@]
+   # output volume as integer percentage 0-100
+   # wpctl outputs float volume rounded to 2 decimal places
+   # remove leading zeros from output (causes bash octal assumption)
+   local zVolume=$(wpctl get-volume "${1:-@DEFAULT_AUDIO_SINK@}")
+   zVolume=$(sed -E 's/[^0-9]//g;s/^0+(.)/\1/' <<< "$zVolume")
+   echo "$zVolume"
+}
+
+SetVolume() { # VOLUME[%][-+] [ID:-@DEFAULT_AUDIO_SINK@] [MAX:-$dVolMax]
+   # VOLUME may be percentage% or literal float
+   # VOLUME may specify float accuracy beyond GetVolume
+   # Inserts stop at 100% if volume setting hops across it
+   # Enforces $dVolumeMax
+   local zId="${2:-@DEFAULT_AUDIO_SINK@}"
+   local zOld=$(GetVolume "$zId")
+   local zError="$(wpctl set-volume "$zId" "$1" 2>&1)" \
+      || Error 1 "$zError" "Could not set $zId volume to $2"
+   local -i zNew=$(GetVolume "$zId")
+   [[ -z "$dVerbose" ]] \
+      || echo "SetVolume $* from $zOld to $zNew"
+   local zMax=${3:-$dVolMax}
+   if [[  "$zMax" -lt "$zNew" ]]; then
+      zError=$(wpctl set-volume "$zId" "$zMax%" 2>&1) \
+         || Error 1 "$zError" "Could not set $zId volume to $zMax (max)"
+      [[ -z "$dVerbose" ]] \
+         || echo "Limit volume to $zMax"
+   elif [[ 100 -gt "$zOld" && 100 -lt "$zNew" ]] \
+           || [[ 100 -lt "$zOld" && 100 -gt "$zNew" ]]; then
+      zError=$(wpctl set-volume "$zId" 1 2>&1) \
+         || Error 1 "$zError" "Could not set $zId volume to 1"
+      [[ -z "$dVerbose" ]] \
+         || echo "Enforce volume stop at 100%"
+   fi
+}
+
+#
+## Main Routines
+#
+
+DeltaVolume() { # [DELTA(-1)][%|(d)][-(+)] # increase|decrease volume by DELTA
+   # adjust @DEFAULT_AUDIO_SINK@ by DELTA%[+|-]
+   # SOURCE pushed toward 100%
+   [[ "$1" =~ ^([0-9]*)([%d]?)([-+]?)$ ]] \
+      || Error 1 "Expecting [DELTA(-1)][%|(d)][-(+)] but found ${1@Q}" \
+               'which did not match regex ^([0-9]*)([%d]?)([-+]?)$'
+   local zDelta=${BASH_REMATCH[1]:-1}
+   local zUnit=${BASH_REMATCH[2]:-d}
+   local zSign=${BASH_REMATCH[3]:-+}
+   local zVol="$(GetVolume @DEFAULT_AUDIO_SINK@)"
+   [[ -z "$dVerbose" ]] \
+      || echo "DeltaVolume $zDelta$zUnit$zSign from sink volume $zVol"
+   [[ d = "$zUnit" ]] \
+      && zDelta=$(bc -l <<< "l($zVol + 1.1) / 2.718 * $zDelta")
+   SetVolume "$zDelta%$zSign" @DEFAULT_AUDIO_SINK@ "$dVolMax"
+}
+
+if [[ 0 != "$#" ]] \
+      || [[ "$0" = "${BASH_SOURCE[0]}" ]]; then # not an include (testing)
+   while [[ 0 != "$#" ]]; do
+      if [[ "$1" =~ ^([-+])([0-9]*)([%d])?[Bb]?$ ]]; then
+         zSign="${BASH_REMATCH[1]}"
+         DeltaVolume "${BASH_REMATCH[@]:1}"
+      else
+         zSign=
+         case "$1" in
+            -v) dVerbose=t
+                ;;
+            -n)
+               zNext="$(GetIdNext)"
+               wpctl set-default "$zNext"
+               [[ -z "$dVerbose" ]] \
+                  || echo "Set default previous sink at $zNext"
+               ;;
+            -p|--prev)
+               zNext="$(GetIdNext -1)"
+               wpctl set-default "$zNext"
+               [[ -z "$dVerbose" ]] \
+                  || echo "Set default previous sink at $zNext"
+               ;;
+            '') ;;
+            *) Error 1 "Unknown argument $1"
+         esac
+      fi
+      shift
+      # notify-send gets lost when given many quick notifications
+      NoteNoLock "$zSign"
+   done
+fi
